@@ -223,7 +223,7 @@ function inferEmptyPercentageSplits(variants) {
  * @param {string} instantExperiment The list of varaints
  * @returns {object} the experiment manifest
  */
-export function getConfigForInstantExperiment(
+function getConfigForInstantExperiment(
   experimentId,
   instantExperiment,
   pluginOptions,
@@ -287,8 +287,15 @@ export function getConfigForInstantExperiment(
  * @param {object} pluginOptions The plugin options
  * @returns {object} containing the experiment manifest
  */
-export async function getConfigForFullExperiment(experimentId, pluginOptions, context) {
-  const path = `${pluginOptions.experimentsRoot}/${experimentId}/${pluginOptions.experimentsConfigFile}`;
+async function getConfigForFullExperiment(experimentId, pluginOptions, context) {
+  let path;
+  if (experimentId.includes(`/${pluginOptions.experimentsConfigFile}`)) {
+    path = new URL(experimentId, window.location.origin).href;
+    // eslint-disable-next-line no-param-reassign
+    [experimentId] = path.split('/').splice(-2, 1);
+  } else {
+    path = `${pluginOptions.experimentsRoot}/${experimentId}/${pluginOptions.experimentsConfigFile}`;
+  }
   try {
     const resp = await fetch(path);
     if (!resp.ok) {
@@ -336,7 +343,7 @@ function getDecisionPolicy(config) {
   return decisionPolicy;
 }
 
-export async function getConfig(experiment, instantExperiment, pluginOptions, context) {
+async function getConfig(experiment, instantExperiment, pluginOptions, context) {
   const usp = new URLSearchParams(window.location.search);
   const [forcedExperiment, forcedVariant] = usp.has(pluginOptions.experimentsQueryParameter)
     ? usp.get(pluginOptions.experimentsQueryParameter).split('/')
@@ -357,7 +364,7 @@ export async function getConfig(experiment, instantExperiment, pluginOptions, co
     : null;
 
   experimentConfig.resolvedAudiences = await getResolvedAudiences(
-    experimentConfig.audiences,
+    experimentConfig.audiences.map(context.toClassName),
     pluginOptions,
     context,
   );
@@ -371,9 +378,6 @@ export async function getConfig(experiment, instantExperiment, pluginOptions, co
   );
 
   window.hlx = window.hlx || {};
-  if (!experimentConfig.run) {
-    return false;
-  }
   window.hlx.experiment = experimentConfig;
 
   // eslint-disable-next-line no-console
@@ -411,6 +415,16 @@ export async function runExperiment(document, options, context) {
   if (!experimentConfig || !isValidExperimentationConfig(experimentConfig)) {
     // eslint-disable-next-line no-console
     console.warn('Invalid experiment config. Please review your metadata, sheet and parser.');
+    return false;
+  }
+
+  const usp = new URLSearchParams(window.location.search);
+  const forcedVariant = usp.has(pluginOptions.experimentsQueryParameter)
+    ? usp.get(pluginOptions.experimentsQueryParameter).split('/')[1]
+    : null;
+  if (!experimentConfig.run && !forcedVariant) {
+    // eslint-disable-next-line no-console
+    console.warn('Experiment will not run. It is either not active or its configured audiences are not resolved.');
     return false;
   }
   // eslint-disable-next-line no-console
@@ -517,7 +531,7 @@ export async function serveAudience(document, options, context) {
   }
 
   const audiences = await getResolvedAudiences(
-    Object.keys(configuredAudiences),
+    Object.keys(configuredAudiences).map(context.toClassName),
     pluginOptions,
     context,
   );
