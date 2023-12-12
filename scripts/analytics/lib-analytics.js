@@ -10,13 +10,14 @@
  * governing permissions and limitations under the License.
  */
 
-import configs from "./config.analytics.js"
+import configs from "./config-analytics.js";
 
 /**
  * Customer's XDM schema namespace
  * @type {string}
  */
-const CUSTOM_SCHEMA_NAMESPACE = '_sitesinternal';
+const CUSTOM_SCHEMA_NAMESPACE = configs.tenantId;
+let documentUnloading = false;
 
 /**
  * Returns experiment id and variant running
@@ -26,8 +27,62 @@ export function getExperimentDetails() {
   if (!window.hlx || !window.hlx.experiment) {
     return null;
   }
-  const { id: experimentId, selectedVariant: experimentVariant } = window.hlx.experiment;
+  const { id: experimentId, selectedVariant: experimentVariant } =
+    window.hlx.experiment;
   return { experimentId, experimentVariant };
+}
+
+/**
+ * Return document last modified
+ */
+const dateTimeFormatOptions = [
+  "en-US",
+  { month: "2-digit", day: "2-digit", year: "numeric" },
+];
+export function getLastModified() {
+  const lastModified = document.lastModified;
+  if (lastModified) {
+    const [month, day, year] = new Intl.DateTimeFormat(...dateTimeFormatOptions)
+      .format(new Date(lastModified))
+      .split("/");
+    return `${year}-${month}-${day}`;
+  }
+
+  return "unknown";
+}
+
+/**
+ * Return experienceId
+ */
+export function getExperienceId() {
+  const url = new URL(window.location.href);
+  if (!window.hlx) {
+    return `${url.href}.${getLastModified()}`;
+  }
+
+  // check for campaigns, experiments, audiences
+  let servedExperiencePathname = null;
+  if (window.hlx.campaign && window.hlx.campaign.servedExperience) {
+    servedExperiencePathname = window.hlx.campaign.servedExperience;
+  } else if (window.hlx.experiment && window.hlx.experiment.servedExperience) {
+    servedExperiencePathname = window.hlx.experiment.servedExperience;
+  } else if (window.hlx.audience && window.hlx.audience.servedExperience) {
+    servedExperiencePathname = window.hlx.audience.servedExperience;
+  }
+
+  if (servedExperiencePathname) {
+    if (servedExperiencePathname.endsWith("index.plain.html")) {
+      servedExperiencePathname = servedExperiencePathname.slice(0, -14);
+    }
+    if (servedExperiencePathname.endsWith(".plain.html")) {
+      servedExperiencePathname = servedExperiencePathname.slice(0, -11);
+    }
+
+    url.pathname = servedExperiencePathname;
+    return `${url.href}.${getLastModified()}`;
+  }
+
+  return `${url.href}.${getLastModified()}`;
 }
 
 /**
@@ -49,16 +104,41 @@ function getAlloyInitScript() {
  * @returns {{edgeConfigId: string, orgId: string}}
  */
 function getDatastreamConfiguration() {
-  // Sites Internal
-  return { ...configs };
+  return {
+    edgeConfigId: configs.edgeConfigId,
+    orgId: configs.orgId,
+  };
 }
 
 /**
+ * Condor asset, experience ids version
+ */
+const condorAssetIdVersion = "5";
+const condorExperienceIdVersion = "5";
+/**
  * Enhance all events with additional details, like experiment running,
- * before sending them to the edge
+ * before sending them to the edge EXCEPT for condor events.
  * @param options event in the XDM schema format
  */
 function enhanceAnalyticsEvent(options) {
+  // Bypass default enhancements for condor events
+  if (
+    options.xdm[CUSTOM_SCHEMA_NAMESPACE] &&
+    options.xdm[CUSTOM_SCHEMA_NAMESPACE].condor
+  ) {
+    // TODO: Drop some of the default tracking props
+    delete options.xdm.device;
+    delete options.xdm.implementationDetails;
+    delete options.xdm.placeContext;
+    delete options.xdm.environment;
+    // Optional: Add condor implementation details
+    options.xdm[CUSTOM_SCHEMA_NAMESPACE].condor.implementationDetails = {
+      assetIdVersion: condorAssetIdVersion,
+      experienceIdVersion: condorExperienceIdVersion,
+    };
+    return;
+  }
+
   const experiment = getExperimentDetails();
   options.xdm[CUSTOM_SCHEMA_NAMESPACE] = {
     ...options.xdm[CUSTOM_SCHEMA_NAMESPACE],
@@ -73,16 +153,20 @@ function enhanceAnalyticsEvent(options) {
  */
 function getAlloyConfiguration(document) {
   const { hostname } = document.location;
+  const debugEnabled =
+    hostname.startsWith("localhost") || hostname.includes("--");
+  documentUnloading = !debugEnabled;
 
   return {
     // enable while debugging
-    debugEnabled: hostname.startsWith('localhost') || hostname.includes('--'),
+    debugEnabled,
     // disable when clicks are also tracked via sendEvent with additional details
     clickCollectionEnabled: true,
     // adjust default based on customer use case
-    defaultConsent: 'pending',
+    defaultConsent: "in",
     ...getDatastreamConfiguration(),
     onBeforeEventSend: (options) => enhanceAnalyticsEvent(options),
+    prehidingStyle: "body { opacity: 0 !important }",
   };
 }
 
@@ -95,7 +179,7 @@ function getAlloyConfiguration(document) {
  * @returns {HTMLScriptElement}
  */
 function createInlineScript(document, element, innerHTML, type) {
-  const script = document.createElement('script');
+  const script = document.createElement("script");
   script.type = type;
   script.innerHTML = innerHTML;
   element.appendChild(script);
@@ -107,15 +191,20 @@ function createInlineScript(document, element, innerHTML, type) {
  * @param xdmData - the xdm data object
  * @returns {Promise<*>}
  */
-async function sendAnalyticsEvent(xdmData) {
+async function sendAnalyticsEvent(xdmData, renderDecisions = false) {
   // eslint-disable-next-line no-undef
   if (!alloy) {
-    console.warn('alloy not initialized, cannot send analytics event');
+    console.warn("alloy not initialized, cannot send analytics event");
     return Promise.resolve();
   }
+
+  // drain viewed assets before sending behavior event
+  // drainAssetsQueue();
+
   // eslint-disable-next-line no-undef
-  return alloy('sendEvent', {
-    documentUnloading: true,
+  return alloy("sendEvent", {
+    renderDecisions,
+    documentUnloading,
     xdm: xdmData,
   });
 }
@@ -129,18 +218,25 @@ async function sendAnalyticsEvent(xdmData) {
 export async function analyticsSetConsent(approved) {
   // eslint-disable-next-line no-undef
   if (!alloy) {
-    console.warn('alloy not initialized, cannot set consent');
+    console.warn("alloy not initialized, cannot set consent");
     return Promise.resolve();
   }
+
+  // if(approved) {
+  //   debouncedDrainAssetsQueue();
+  // }
+
   // eslint-disable-next-line no-undef
-  return alloy('setConsent', {
-    consent: [{
-      standard: 'Adobe',
-      version: '1.0',
-      value: {
-        general: approved ? 'in' : 'out',
+  return alloy("setConsent", {
+    consent: [
+      {
+        standard: "Adobe",
+        version: "1.0",
+        value: {
+          general: approved ? "in" : "out",
+        },
       },
-    }],
+    ],
   });
 }
 
@@ -150,9 +246,12 @@ export async function analyticsSetConsent(approved) {
  * @param additionalXdmFields
  * @returns {Promise<*>}
  */
-export async function analyticsTrackPageViews(document, additionalXdmFields = {}) {
+export async function analyticsTrackPageViews(
+  document,
+  additionalXdmFields = {}
+) {
   const xdmData = {
-    eventType: 'web.webpagedetails.pageViews',
+    eventType: "web.webpagedetails.pageViews",
     web: {
       webPageDetails: {
         pageViews: {
@@ -166,7 +265,7 @@ export async function analyticsTrackPageViews(document, additionalXdmFields = {}
     },
   };
 
-  return sendAnalyticsEvent(xdmData);
+  return sendAnalyticsEvent(xdmData, true);
 }
 
 /**
@@ -174,7 +273,12 @@ export async function analyticsTrackPageViews(document, additionalXdmFields = {}
  * @returns {Promise<void>}
  */
 export async function initAnalyticsTrackingQueue() {
-  createInlineScript(document, document.body, getAlloyInitScript(), 'text/javascript');
+  createInlineScript(
+    document,
+    document.body,
+    getAlloyInitScript(),
+    "text/javascript"
+  );
 }
 
 /**
@@ -185,17 +289,21 @@ export async function initAnalyticsTrackingQueue() {
 export async function setupAnalyticsTrackingWithAlloy(document) {
   // eslint-disable-next-line no-undef
   if (!alloy) {
-    console.warn('alloy not initialized, cannot configure');
+    console.warn("alloy not initialized, cannot configure");
     return;
   }
   // eslint-disable-next-line no-undef
-  const configurePromise = alloy('configure', getAlloyConfiguration(document));
+  const configurePromise = alloy("configure", getAlloyConfiguration(document));
 
   // Custom logic can be inserted here in order to support early tracking before alloy library
   // loads, for e.g. for page views
   const pageViewPromise = analyticsTrackPageViews(document); // track page view early
 
-  await import('./alloy.min.js');
+  // assets tracking
+  // const assetsViewedPromise = trackAssetsViews(document);
+  // const assetsClickedPromise = trackAssetsClicks(document);
+
+  await import("./alloy.min.js");
   await Promise.all([configurePromise, pageViewPromise]);
 }
 
@@ -207,14 +315,24 @@ export async function setupAnalyticsTrackingWithAlloy(document) {
  * @param additionalXdmFields
  * @returns {Promise<*>}
  */
-export async function analyticsTrackLinkClicks(element, linkType = 'other', additionalXdmFields = {}) {
+export async function analyticsTrackLinkClicks(
+  element,
+  linkType = "other",
+  additionalXdmFields = {}
+) {
   const xdmData = {
-    eventType: 'web.webinteraction.linkClicks',
+    eventType: "web.webinteraction.linkClicks",
     web: {
       webInteraction: {
         URL: `${element.href}`,
         // eslint-disable-next-line no-nested-ternary
-        name: `${element.text ? element.text.trim() : (element.innerHTML ? element.innerHTML.trim() : '')}`,
+        name: `${
+          element.text
+            ? element.text.trim()
+            : element.innerHTML
+            ? element.innerHTML.trim()
+            : ""
+        }`,
         linkClicks: {
           value: 1,
         },
@@ -236,7 +354,7 @@ export async function analyticsTrackLinkClicks(element, linkType = 'other', addi
  */
 export async function analyticsTrackCWV(cwv) {
   const xdmData = {
-    eventType: 'web.performance.measurements',
+    eventType: "web.performance.measurements",
     [CUSTOM_SCHEMA_NAMESPACE]: {
       cwv,
     },
@@ -253,7 +371,7 @@ export async function analyticsTrackCWV(cwv) {
  */
 export async function analyticsTrack404(data, additionalXdmFields = {}) {
   const xdmData = {
-    eventType: 'web.webpagedetails.pageViews',
+    eventType: "web.webpagedetails.pageViews",
     web: {
       webPageDetails: {
         pageViews: {
@@ -272,7 +390,7 @@ export async function analyticsTrack404(data, additionalXdmFields = {}) {
 
 export async function analyticsTrackError(data, additionalXdmFields = {}) {
   const xdmData = {
-    eventType: 'web.webpagedetails.pageViews',
+    eventType: "web.webpagedetails.pageViews",
     web: {
       webPageDetails: {
         pageViews: {
@@ -293,7 +411,7 @@ export async function analyticsTrackConversion(data, additionalXdmFields = {}) {
   const { source: conversionName, target: conversionValue, element } = data;
 
   const xdmData = {
-    eventType: 'web.webinteraction.conversion',
+    eventType: "web.webinteraction.conversion",
     [CUSTOM_SCHEMA_NAMESPACE]: {
       conversion: {
         conversionComplete: 1,
@@ -304,8 +422,8 @@ export async function analyticsTrackConversion(data, additionalXdmFields = {}) {
     },
   };
 
-  if (element.tagName === 'FORM') {
-    xdmData.eventType = 'web.formFilledOut';
+  if (element.tagName === "FORM") {
+    xdmData.eventType = "web.formFilledOut";
     const formId = element?.id || element?.dataset?.action;
     xdmData[CUSTOM_SCHEMA_NAMESPACE].form = {
       ...(formId && { formId }),
@@ -313,19 +431,25 @@ export async function analyticsTrackConversion(data, additionalXdmFields = {}) {
       // track only the details of the form together with the conversion
       formComplete: 0,
     };
-  } else if (element.tagName === 'A') {
-    xdmData.eventType = 'web.webinteraction.linkClicks';
+  } else if (element.tagName === "A") {
+    xdmData.eventType = "web.webinteraction.linkClicks";
     xdmData.web = {
       webInteraction: {
         URL: `${element.href}`,
         // eslint-disable-next-line no-nested-ternary
-        name: `${element.text ? element.text.trim() : (element.innerHTML ? element.innerHTML.trim() : '')}`,
+        name: `${
+          element.text
+            ? element.text.trim()
+            : element.innerHTML
+            ? element.innerHTML.trim()
+            : ""
+        }`,
         linkClicks: {
           // don't count as link click, as this event should be tracked separately,
           // track only the details of the link with the conversion
           value: 0,
         },
-        type: 'other',
+        type: "other",
       },
     };
   }
@@ -339,10 +463,13 @@ export async function analyticsTrackConversion(data, additionalXdmFields = {}) {
  * @param additionalXdmFields
  * @returns {Promise<*>}
  */
-export async function analyticsTrackFormSubmission(element, additionalXdmFields = {}) {
+export async function analyticsTrackFormSubmission(
+  element,
+  additionalXdmFields = {}
+) {
   const formId = element?.id || element?.dataset?.action;
   const xdmData = {
-    eventType: 'web.formFilledOut',
+    eventType: "web.formFilledOut",
     [CUSTOM_SCHEMA_NAMESPACE]: {
       form: {
         ...(formId && { formId }),
@@ -361,9 +488,10 @@ export async function analyticsTrackFormSubmission(element, additionalXdmFields 
  * @param additionalXdmFields
  * @returns {Promise<*>}
  */
-export async function analyticsTrackVideo({
-  id, name, type, hasStarted, hasCompleted, progressMarker,
-}, additionalXdmFields) {
+export async function analyticsTrackVideo(
+  { id, name, type, hasStarted, hasCompleted, progressMarker },
+  additionalXdmFields
+) {
   const primaryAssetReference = {
     id: `${id}`,
     dc: {
@@ -383,14 +511,171 @@ export async function analyticsTrackVideo({
   };
 
   if (hasStarted) {
-    baseXdm[CUSTOM_SCHEMA_NAMESPACE].media.mediaTimed.impressions = { value: 1 };
+    baseXdm[CUSTOM_SCHEMA_NAMESPACE].media.mediaTimed.impressions = {
+      value: 1,
+    };
   } else if (hasCompleted) {
     baseXdm[CUSTOM_SCHEMA_NAMESPACE].media.mediaTimed.completes = { value: 1 };
   } else if (progressMarker) {
-    baseXdm[CUSTOM_SCHEMA_NAMESPACE].media.mediaTimed[progressMarker] = { value: 1 };
+    baseXdm[CUSTOM_SCHEMA_NAMESPACE].media.mediaTimed[progressMarker] = {
+      value: 1,
+    };
   } else {
     return Promise.resolve();
   }
 
   return sendAnalyticsEvent(baseXdm);
 }
+
+// /**
+//  * Customer's Condor assets event dataset id
+//  * @type {string}
+//  */
+// const CONDOR_DATASET_ID = '655e1f4aea251428d3821ea8';
+
+// /**
+//  * Assets views debounce timeout
+//  */
+// const ASSETS_VIEWS_DEBOUNCE_TIMEOUT = 5000; // 2.5 seconds
+// /**
+//  * Debounces a function
+//  */
+// function debounce(func, timeout = ASSETS_VIEWS_DEBOUNCE_TIMEOUT) {
+//   let timer;
+//   return (...args) => {
+//     clearTimeout(timer);
+//     timer = setTimeout(() => {
+//       func.apply(this, args);
+//     }, timeout);
+//   };
+// }
+
+// /**
+//  * Extract asset url
+//  */
+// const assetSrcURL = (element) => {
+//   const value = element.currentSrc || element.src || element.getAttribute('src');
+//   if (value && value.startsWith('https://')) {
+//     // resolve relative links
+//     const srcURL = new URL(value, window.location);
+//     srcURL.search = '';
+//     return srcURL;
+//   }
+
+//   const srcURL = new URL(value);
+//   srcURL.search = '';
+//   return srcURL;
+// };
+
+// /**
+//  * Sends an analytics condor event to alloy
+//  * @param xdmData - the xdm data object
+//  * @returns {Promise<*>}
+//  */
+// async function sendCondorEvent(xdmData) {
+//   // eslint-disable-next-line no-undef
+//   if (!alloy) {
+//     console.warn('alloy not initialized, cannot send analytics event');
+//     return Promise.resolve();
+//   }
+
+//   // eslint-disable-next-line no-undef
+//   return alloy('sendEvent', {
+//     documentUnloading,
+//     xdm: xdmData,
+//     edgeConfigOverrides: {
+//       com_adobe_experience_platform: {
+//         datasets: { event: { datasetId: CONDOR_DATASET_ID } }
+//       },
+//     },
+//   });
+// }
+
+// /**
+//  * Basic tracking for assets views with alloy
+//  * @param assets - string[]
+//  * @returns {Promise<*>}
+//  */
+// export async function analyticsTrackAssetsViews(assets) {
+//   const xdmData = {
+//     [CUSTOM_SCHEMA_NAMESPACE]: {
+//       condor: {
+//         assets: { ids: assets, type: 'image' },
+//         experience: { id: getExperienceId() },
+//         eventType: 'viewed',
+//       },
+//     },
+//   };
+
+//   return sendCondorEvent(xdmData);
+// }
+
+// /**
+//  * Basic tracking for assets clicks with alloy
+//  * @param url - string
+//  * @param assets - string[]
+//  * @returns {Promise<*>}
+//  */
+// export async function analyticsTrackAssetsClicked(assets, URL) {
+//   const xdmData = {
+//     eventType: 'web.webinteraction.linkClicks',
+//     web: { webInteraction: { URL, linkClicks: { value: 1 }, type: 'other' } }, // linkType can be 'download' or 'other'
+//     [CUSTOM_SCHEMA_NAMESPACE]: {
+//       condor: {
+//         assets: { ids: assets, type: 'image' },
+//         experience: { id: getExperienceId() },
+//         eventType: 'clicked',
+//       },
+//     },
+//   };
+
+//   return sendCondorEvent(xdmData);
+// }
+
+// // Assets views
+// const assetsViews = new Set();
+// export function trackAssetsViews(document) {
+//   const docAssets = document.querySelectorAll('picture > img');
+//   docAssets.forEach((assetElement) => {
+//     const tag = assetElement.tagName.toLowerCase();
+//     if (tag === 'img') {
+//       imageObserver.observe(assetElement);
+//     }
+//   });
+// };
+
+// function drainAssetsQueue() {
+//   if (assetsViews.size) {
+//     analyticsTrackAssetsViews(Array.from(assetsViews));
+//     assetsViews.clear();
+//   }
+// }
+// const debouncedDrainAssetsQueue = debounce(() => drainAssetsQueue());
+// window.addEventListener('visibilitychange', drainAssetsQueue);
+// window.addEventListener('pagehide', drainAssetsQueue);
+
+// const imageObserver = window.IntersectionObserver
+//   ? new IntersectionObserver(
+//     (entries) => {
+//       entries
+//         .filter((entry) => entry.isIntersecting)
+//         .forEach((entry) => {
+//           imageObserver.unobserve(entry.target);
+//           assetsViews.add(assetSrcURL(entry.target).href);
+//           debouncedDrainAssetsQueue();
+//         });
+//     },
+//     { threshold: 0.5 },
+//   )
+//   : { observe: () => {} };
+
+// // Assets clicks
+// export const trackAssetsClicks = (document) => {
+//   const docAssets = document.querySelectorAll('a > picture > img');
+//   docAssets.forEach((assetElement) => {
+//     assetElement.addEventListener("click", () => {
+//       const href = assetElement.parentElement.parentElement.href;
+//       analyticsTrackAssetsClicked([assetSrcURL(assetElement).href], href);
+//     });
+//   });
+// }

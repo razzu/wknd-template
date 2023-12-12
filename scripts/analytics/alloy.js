@@ -10494,7 +10494,7 @@
   governing permissions and limitations under the License.
   */
   var EDGE = "beta.adobedc.net";
-  var ID_THIRD_PARTY = "adobedc.demdex.net";
+  var ID_THIRD_PARTY = "beta.adobedc.net";
 
   /*
   Copyright 2023 Adobe. All rights reserved.
