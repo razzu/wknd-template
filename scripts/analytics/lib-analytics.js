@@ -10,6 +10,8 @@
  * governing permissions and limitations under the License.
  */
 
+import configs from "./config.analytics.js"
+
 /**
  * Customer's XDM schema namespace
  * @type {string}
@@ -48,10 +50,7 @@ function getAlloyInitScript() {
  */
 function getDatastreamConfiguration() {
   // Sites Internal
-  return {
-    edgeConfigId: 'caad777c-c410-4ceb-8b36-167f1cecc3de',
-    orgId: '908936ED5D35CC220A495CD4@AdobeOrg',
-  };
+  return { ...configs };
 }
 
 /**
